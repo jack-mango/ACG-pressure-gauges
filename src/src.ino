@@ -14,10 +14,6 @@
 #define OLED_RESET     -1
 #define SCREEN_ADDRESS 0x3D
 
-// Pins used to interface with the OLED screen
-# define OLED_RST -1;
-# define OLED_ADDRESS 0x3D
-
 // OLED screen size
 # define OLED_WIDTH 128
 # define OLED_HEIGHT 64
@@ -26,7 +22,12 @@
 static const int chOffsetX[] = {0, 64, 0, 64};
 static const int chOffsetY[] = {0, 0, 32, 32};
 
-float multipliers[] = {100, 1, 1, 1};
+// Scaling from the voltage divider; needed to stay within the ADS1115's input range.
+float multipliers[] = {1, 1, 1, 1};
+
+// The conversion between the unscaled voltage and pressure
+# define TORR_PER_VOLT 313
+
 
 Adafruit_ADS1115 ads1115_12, ads1115_34;
 Adafruit_SSD1306 display(OLED_WIDTH, OLED_HEIGHT, &Wire, OLED_RESET);
@@ -38,6 +39,10 @@ void setup(void)
   // Initialize ADS1115 chips and OLED display
   ads1115_12.begin(CH12_ADDRESS);
   ads1115_34.begin(CH34_ADDRESS);
+
+  // Change the gain to one (default is 2/3)
+  ads1115_12.setGain(GAIN_ONE);
+  ads1115_34.setGain(GAIN_ONE);
 
   display.begin(SSD1306_SWITCHCAPVCC, SCREEN_ADDRESS);
 
@@ -57,8 +62,13 @@ void loop(void)
   delay(UPDATE_INTERVAL);
 }
 
-// Initialize the layout of the OLED display
 void initDisplay(void) {
+  /**
+ * @brief Initializes the SSD1306 OLED display. 
+ * 
+ * Divides screen into four with vertical and horizontal
+ * lines and labels each quadrant with corresponding channel number.
+ */
   display.clearDisplay();
 
   // Clear the buffer
@@ -80,8 +90,15 @@ void initDisplay(void) {
   return;
 }
 
-// Retrieve a single message from the serial buffer
 void handleSerialInput(void) {
+ /**
+ * @brief Retrieve a single message from the serial buffer, handle it and send a response
+ * 
+ * Get a message from the serial buffer. If a message is incorrectly formatted or unrecognized
+ * an error message will be sent back on the serial line. When a command is recognized the proper
+ * handler function is called and its response is written back on the serial interface to the sender.
+ *
+ */
   if (Serial.available() > 0) {
     String message = getMessage();
     String func = message.substring(3, 5);
@@ -96,24 +113,37 @@ void handleSerialInput(void) {
       response = func + "?";
     }
     response = '*' + response + '\r';
-    Serial.print(response);
+    Serial.println(response);
   }
   return;
 }
 
-// Update the OLED display with pressure values
 void updateGauges(void) {
-  for (int i = 1; i < 3; i++) {
+ /**
+ * @brief Update the OLED display with pressure values
+ * 
+ * For each pressure gauge, determine the pressure and change the display.
+ *
+ */
+  for (int i = 1; i <= 4; i++) {
     String value = getPressure(i);
     updateDisplay(i, value);
     delay(UPDATE_INTERVAL);
   }
 }
 
-
-// update the LCD display used by the pressure gauge monitor
 void updateDisplay(int channel, String value)
 {
+ /**
+ * @brief Update the LCD display used by the pressure gauge monitor
+ * 
+ * Blank out the quadrant of the SSD1306 corresponding to the provided `channel` then 
+ * write the provided value inside that quadrant.
+ * 
+ * @param channel the channel number to be updated. Should be between 1 and 4.
+ * @param value the value to dispaly on the corresponding channel.
+ *
+ */
   channel = channel - 1; // switch from one to zero indexing
 
   // Blank out spot used by given channel to hide old reading
@@ -133,9 +163,18 @@ void updateDisplay(int channel, String value)
   return;
 }
 
-// Retrieve a single message from the serial buffer. A message will always start with a '#' and be terminated by a carriage return, '\r'
 String getMessage(void)
 {
+ /**
+ * @brief Retrieve a single message from the serial buffer. 
+ * 
+ * This function reads from the serial buffer assuming it's aligned, that is the first character should correspond to 
+ * the start character '#' of a message. If not the serial buffer is unaligned and all inputs are flushed. We keep reading
+ * until the stop character '\r' is retrieved. If no stop character was found (we stop reading after 20 characters) then
+ * the message was improperly formatted and we do nothing.
+ * 
+ * @return The message read from the serial buffer.
+ */
   String message = "";
   // Check if there is data available in the serial buffer
   if (Serial.available() > 0) {
@@ -144,9 +183,11 @@ String getMessage(void)
     // Check if the character is the start of the message
     if (incomingChar == '#') {
       // Process the message until a carriage return is encountered
-      while (incomingChar != '\r') {
+      int i = 0;
+      while (incomingChar != '\r' and i < 20) {
         // Append the character to the message
         message += incomingChar;
+        i += 1;
         // Read the next character
         incomingChar = Serial.read();
       }
@@ -159,8 +200,18 @@ String getMessage(void)
   }
 }
 
-// Get pressure reading from the specified channel
 String getPressure(int channel) {
+  /**
+ * @brief Get pressure reading from the specified channel
+ * 
+ * This function converts the bit message from the corresponding ADS to a 
+ * pressure value. If the channel number is unrecognized an error message is returned.
+ * The response is formatted as a string using scientific notation. See the README for 
+ * formatting details
+ * 
+ * @param a channel - should be between 1 and 4.
+ * @return a formatted string containing the pressure reading for that channel.
+ */
   int16_t bits;
   // Determine the channel to read from
   switch (channel) {
@@ -184,7 +235,7 @@ String getPressure(int channel) {
       return "?";
   }
   // Convert the bits returned by the ADS1115 to a pressure
-  float pressure = bits * BITS_MULTIPLIER * multipliers[channel];
+  float pressure = bits * BITS_MULTIPLIER * TORR_PER_VOLT * multipliers[channel];
   // Turn this float into a string which will either be displayed on the OLED or sent over the serial interface.
   char buffer[40];
   dtostre(pressure, buffer, 2, 4); // Set flags bit to 0b0100 to make the exponent symbol capital; 'E' rather than default 'e'
@@ -193,9 +244,20 @@ String getPressure(int channel) {
 }
 
 
-// Update multiplier for a specific channel
+
 String updateMultiplier(int channel, float value, float multipliers[]) {
-  multipliers[channel] = value;
+  /**
+ * @brief Update multiplier for a specific channel
+ * 
+ * This function changes the multipliers and returns a response indicating that multipliers were properly
+ * set.
+ * 
+ * @param channel The channel number who's multiplier should be updated - should be between 1 and 4.
+ * @param value The value which the multiplier is changed to.
+ * @param multipliers The current multipliers.
+ * @return A response indicating whether the multiplier was successfully updated.
+ */
+  multipliers[channel-1] = value;
   String response = F("PROGM_OK");
   return response;
 }
